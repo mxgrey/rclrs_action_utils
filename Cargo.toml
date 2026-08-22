@@ -1,0 +1,13 @@
+[package]
+name = "rclrs_action_utils"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rclrs = { git = "https://github.com/mxgrey/ros2_rust", branch = "action_goal_status" }
+tokio = { version = "*", features = ["sync"] }
+futures = "*"
+
+[dev-dependencies]
+ros-env = "*"
+smol = "*"
