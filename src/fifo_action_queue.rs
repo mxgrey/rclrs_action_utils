@@ -1,11 +1,8 @@
 use crate::{FifoQueue, FifoQueueInternal};
 
+use futures::{future::BoxFuture, lock::Mutex};
+use rclrs::{AcceptedGoal, ActionIDL, RequestedGoal, TerminatedGoal};
 use std::sync::Arc;
-use futures::{
-    future::BoxFuture,
-    lock::Mutex,
-};
-use rclrs::{ActionIDL, AcceptedGoal, RequestedGoal, TerminatedGoal};
 
 pub struct FifoActionQueue<Action> {
     internal: Arc<Mutex<FifoQueueInternal>>,
@@ -56,11 +53,15 @@ impl<Action: ActionIDL> FifoActionQueue<Action> {
     ///     Fibonacci, Fibonacci_Feedback, Fibonacci_Goal, Fibonacci_Result,
     /// };
     ///
-    /// async fn accept_beneath_100(goal: Arc<Fibonacci_Goal>) -> bool {
-    ///     goal.order < 100
+    /// async fn accept_beneath_100(goal: Arc<Fibonacci_Goal>) -> Option<()> {
+    ///     if goal.order < 100 {
+    ///         Some(())
+    ///     } else {
+    ///         None
+    ///     }
     /// }
     ///
-    /// async fn execute_fibonacci_slowly(accepted: AcceptedGoal<Fibonacci>) -> TerminatedGoal {
+    /// async fn execute_fibonacci_slowly(accepted: AcceptedGoal<Fibonacci>, _: ()) -> TerminatedGoal {
     ///     let executing = match accepted.begin() {
     ///         BeginAcceptedGoal::Execute(executing) => executing,
     ///         BeginAcceptedGoal::Cancel(cancelled) => {
@@ -107,16 +108,17 @@ impl<Action: ActionIDL> FifoActionQueue<Action> {
     ///     ),
     /// );
     /// ```
-    pub fn serve<Accept, Acceptance, Execute, Execution>(
+    pub fn serve<Evaluation, Accept, Acceptance, Execute, Execution>(
         &self,
         accept: Accept,
         execute: Execute,
     ) -> impl FnMut(RequestedGoal<Action>) -> BoxFuture<'static, TerminatedGoal>
-    + use<Action, Accept, Acceptance, Execute, Execution>
+    + use<Action, Evaluation, Accept, Acceptance, Execute, Execution>
     where
+        Evaluation: 'static + Send,
         Accept: FnMut(Arc<Action::Goal>) -> Acceptance + 'static + Send + Sync,
-        Acceptance: Future<Output = bool> + 'static + Send + Sync,
-        Execute: FnMut(AcceptedGoal<Action>) -> Execution + 'static + Send + Sync,
+        Acceptance: Future<Output = Option<Evaluation>> + 'static + Send + Sync,
+        Execute: FnMut(AcceptedGoal<Action>, Evaluation) -> Execution + 'static + Send + Sync,
         Execution: Future<Output = TerminatedGoal> + 'static + Send + Sync,
     {
         let internal = Arc::clone(&self.internal);
@@ -127,12 +129,13 @@ impl<Action: ActionIDL> FifoActionQueue<Action> {
             let receive = Arc::clone(&accept);
             let execute = Arc::clone(&execute);
             let future = async move {
-                {
+                let evaluation = {
                     let mut receive = receive.lock().await;
-                    if !receive(Arc::clone(request.goal())).await {
-                        return request.reject();
+                    match receive(Arc::clone(request.goal())).await {
+                        Some(evaluation) => evaluation,
+                        None => return request.reject(),
                     }
-                }
+                };
 
                 let accepted = request.accept();
 
@@ -147,7 +150,7 @@ impl<Action: ActionIDL> FifoActionQueue<Action> {
                 }
 
                 let mut execute = execute.lock().await;
-                let termination = execute(accepted).await;
+                let termination = execute(accepted, evaluation).await;
 
                 let mut internal = internal.lock().await;
                 internal.next();
@@ -165,74 +168,71 @@ impl<Action: ActionIDL> FifoActionQueue<Action> {
     /// at a time.
     pub fn accept_all<Execute, Execution>(
         &self,
-        execute: Execute,
+        mut execute: Execute,
     ) -> impl FnMut(RequestedGoal<Action>) -> BoxFuture<'static, TerminatedGoal>
     + use<Action, Execute, Execution>
     where
         Execute: FnMut(AcceptedGoal<Action>) -> Execution + 'static + Send + Sync,
         Execution: Future<Output = TerminatedGoal> + 'static + Send + Sync,
     {
+        let execute = move |goal, _| execute(goal);
+
         self.serve(accept_all::<Action>, execute)
     }
 }
 
-async fn accept_all<A: ActionIDL>(_: Arc<A::Goal>) -> bool {
-    true
+async fn accept_all<A: ActionIDL>(_: Arc<A::Goal>) -> Option<()> {
+    Some(())
 }
 
 #[cfg(test)]
 mod tests {
     use crate::FifoActionQueue;
+    use futures::lock::Mutex;
     use rclrs::*;
     use ros_env::example_interfaces::action::{
         Fibonacci, Fibonacci_Feedback, Fibonacci_Goal, Fibonacci_Result,
     };
-    use futures::lock::Mutex;
     use std::sync::Arc;
 
     #[test]
     fn test_action_queue() {
         let context = Context::default();
         let mut executor = context.create_basic_executor();
-        let node = executor.create_node(&format!("test_action_queue_node_{}", line!())).unwrap();
+        let node = executor
+            .create_node(&format!("test_action_queue_node_{}", line!()))
+            .unwrap();
 
         let action_topic = format!("test_action_queue_topic_{}", line!());
         let (request_next, wait_for_next) = tokio::sync::mpsc::unbounded_channel();
         let wait_for_next = Arc::new(Mutex::new(wait_for_next));
 
-        let action_server = node.create_action_server::<Fibonacci, _>(
-            &action_topic,
-            FifoActionQueue::<Fibonacci>::new().serve(
-                move |request: Arc<Fibonacci_Goal>| {
-                    async move {
-                        request.order < 100
-                    }
-                },
-                move |accepted: AcceptedGoal<_>| {
-                    let wait_for_next = wait_for_next.clone();
-                    fibonacci_test_server(wait_for_next, accepted)
-                }
-            ),
-        ).unwrap();
+        let action_server = node
+            .create_action_server(
+                &action_topic,
+                FifoActionQueue::<Fibonacci>::new().serve(
+                    move |request: Arc<Fibonacci_Goal>| async move {
+                        if request.order < 100 { Some(()) } else { None }
+                    },
+                    move |accepted: AcceptedGoal<_>, _| {
+                        let wait_for_next = wait_for_next.clone();
+                        fibonacci_test_server(wait_for_next, accepted)
+                    },
+                ),
+            )
+            .unwrap();
 
-        let action_client = node.create_action_client::<Fibonacci>(&action_topic).unwrap();
+        let action_client = node
+            .create_action_client::<Fibonacci>(&action_topic)
+            .unwrap();
 
         let test_finished = executor.commands().run(async move {
-            let client_for_notify = action_client.clone();
-            let _ = node.notify_on_graph_change(move || client_for_notify.server_is_available().is_ok_and(|v| v)).await;
+            let _ = action_client.notify_on_server_ready().await;
 
-            let first_requested_goal = action_client.request_goal(Fibonacci_Goal {
-                order: 3,
-            });
-            let invalid_requested_goal = action_client.request_goal(Fibonacci_Goal {
-                order: 1000,
-            });
-            let second_requested_goal = action_client.request_goal(Fibonacci_Goal {
-                order: 10,
-            });
-            let third_requested_goal = action_client.request_goal(Fibonacci_Goal {
-                order: 10,
-            });
+            let first_requested_goal = action_client.request_goal(Fibonacci_Goal { order: 3 });
+            let invalid_requested_goal = action_client.request_goal(Fibonacci_Goal { order: 1000 });
+            let second_requested_goal = action_client.request_goal(Fibonacci_Goal { order: 10 });
+            let third_requested_goal = action_client.request_goal(Fibonacci_Goal { order: 10 });
 
             let mut first_goal = first_requested_goal.await.unwrap();
 
@@ -247,23 +247,26 @@ mod tests {
             assert!(second_goal.feedback.try_recv().is_err());
             assert!(third_goal.feedback.try_recv().is_err());
 
-            first_goal.status.wait_for(|s| {
-                s.code == GoalStatusCode::Executing
-            }).await.unwrap();
+            first_goal
+                .status
+                .wait_for(|s| s.code == GoalStatusCode::Executing)
+                .await
+                .unwrap();
 
-            second_goal.status.wait_for(|s| {
-                s.code == GoalStatusCode::Accepted
-            }).await.unwrap();
+            second_goal
+                .status
+                .wait_for(|s| s.code == GoalStatusCode::Accepted)
+                .await
+                .unwrap();
 
-            third_goal.status.wait_for(|s| {
-                s.code == GoalStatusCode::Accepted
-            }).await.unwrap();
+            third_goal
+                .status
+                .wait_for(|s| s.code == GoalStatusCode::Accepted)
+                .await
+                .unwrap();
 
             let _ = request_next.send(());
-            assert_eq!(
-                first_goal.feedback.recv().await.unwrap().sequence,
-                vec![0],
-            );
+            assert_eq!(first_goal.feedback.recv().await.unwrap().sequence, vec![0],);
             assert!(second_goal.feedback.try_recv().is_err());
             assert!(third_goal.feedback.try_recv().is_err());
 
@@ -283,25 +286,26 @@ mod tests {
             assert!(second_goal.feedback.try_recv().is_err());
             assert!(third_goal.feedback.try_recv().is_err());
 
-            first_goal.status.wait_for(|s| {
-                s.code == GoalStatusCode::Succeeded
-            }).await.unwrap();
+            first_goal
+                .status
+                .wait_for(|s| s.code == GoalStatusCode::Succeeded)
+                .await
+                .unwrap();
 
             let (code, result) = first_goal.result.await;
             assert!(code == GoalStatusCode::Succeeded);
             assert_eq!(result.sequence, vec![0, 1, 1]);
 
-            second_goal.status.wait_for(|s| {
-                s.code == GoalStatusCode::Executing
-            }).await.unwrap();
+            second_goal
+                .status
+                .wait_for(|s| s.code == GoalStatusCode::Executing)
+                .await
+                .unwrap();
 
             assert_eq!(third_goal.status.borrow().code, GoalStatusCode::Accepted);
 
             let _ = request_next.send(());
-            assert_eq!(
-                second_goal.feedback.recv().await.unwrap().sequence,
-                vec![0],
-            );
+            assert_eq!(second_goal.feedback.recv().await.unwrap().sequence, vec![0],);
             assert!(third_goal.feedback.try_recv().is_err());
 
             let _ = request_next.send(());
@@ -316,9 +320,11 @@ mod tests {
             assert_eq!(code, GoalStatusCode::Cancelled);
             assert_eq!(result.sequence, vec![0, 1]);
 
-            third_goal.status.wait_for(|s| {
-                s.code == GoalStatusCode::Executing
-            }).await.unwrap();
+            third_goal
+                .status
+                .wait_for(|s| s.code == GoalStatusCode::Executing)
+                .await
+                .unwrap();
 
             assert!(third_goal.feedback.try_recv().is_err());
 
@@ -362,10 +368,14 @@ mod tests {
         let mut current = 1;
 
         for _ in 0..executing.goal().order {
-            if executing.unless_cancel_requested(wait_for_next.lock().await.recv()).await.is_err() {
-                return executing.begin_cancelling().cancelled_with(Fibonacci_Result {
-                    sequence,
-                });
+            if executing
+                .unless_cancel_requested(wait_for_next.lock().await.recv())
+                .await
+                .is_err()
+            {
+                return executing
+                    .begin_cancelling()
+                    .cancelled_with(Fibonacci_Result { sequence });
             }
 
             sequence.push(previous);
@@ -381,5 +391,4 @@ mod tests {
 
         executing.succeeded_with(Fibonacci_Result { sequence })
     }
-
 }
