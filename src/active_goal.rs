@@ -1,4 +1,4 @@
-use rclrs::{ActionIDL, ExecutingGoal, CancellingGoal, TerminatedGoal, FeedbackPublisher};
+use rclrs::{ActionIDL, CancellingGoal, ExecutingGoal, FeedbackPublisher, TerminatedGoal};
 use std::sync::Arc;
 
 /// Represents a goal that is still active, either executing or cancelling.

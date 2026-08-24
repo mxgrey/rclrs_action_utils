@@ -1,12 +1,9 @@
 use crate::FifoActionQueue;
 
-use tokio::sync::oneshot::{self, Sender, Receiver};
-use std::{
-    sync::Arc,
-    collections::VecDeque,
-};
-use rclrs::ActionIDL;
 use futures::lock::Mutex;
+use rclrs::ActionIDL;
+use std::{collections::VecDeque, sync::Arc};
+use tokio::sync::oneshot::{self, Receiver, Sender};
 
 /// A First-In-First-Out queue for regulating async behaviors. This is the
 /// backbone of [`FifoActionQueue`].
