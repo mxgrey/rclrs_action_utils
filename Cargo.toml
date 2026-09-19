@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rclrs = { git = "https://github.com/mxgrey/ros2_rust", branch = "action_goal_status" }
+rclrs = { git = "https://github.com/ros2-rust/ros2_rust", branch = "main" }
 tokio = { version = "*", features = ["sync"] }
 futures = "*"
 
